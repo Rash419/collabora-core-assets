@@ -1,0 +1,184 @@
+name: Build Core Assets
+
+on:
+  workflow_dispatch:
+    inputs:
+      core_tag:
+        description: 'Core tag to build (e.g. co-25.04.10-1). Leave empty to auto-detect latest.'
+        required: false
+        default: ''
+        type: string
+  schedule:
+    # Weekly on Sunday at 02:00 UTC
+    - cron: '0 2 * * 0'
+
+permissions:
+  contents: write
+
+jobs:
+  resolve-tag:
+    runs-on: ubuntu-24.04
+    outputs:
+      core_tag: ${{ steps.resolve.outputs.core_tag }}
+      skip: ${{ steps.check.outputs.skip }}
+    steps:
+      - name: Resolve core tag
+        id: resolve
+        run: |
+          CORE_TAG="${{ inputs.core_tag }}"
+          if [ -z "$CORE_TAG" ]; then
+            echo "No tag specified, finding latest co-25.04* tag..."
+            CORE_TAG=$(git ls-remote --tags --sort=-v:refname \
+              https://git.libreoffice.org/core 'refs/tags/co-25.04*' \
+              | grep -v '\^{}' | head -1 | sed 's|.*refs/tags/||')
+          fi
+          if [ -z "$CORE_TAG" ]; then
+            echo "::error::Could not resolve a core tag"
+            exit 1
+          fi
+          echo "Resolved core tag: $CORE_TAG"
+          echo "core_tag=$CORE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Check if release already exists
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.resolve.outputs.core_tag }}"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "Release $TAG already exists, skipping build."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No existing release for $TAG, will build."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: resolve-tag
+    if: needs.resolve-tag.outputs.skip != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    env:
+      CORE_TAG: ${{ needs.resolve-tag.outputs.core_tag }}
+
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential git autoconf automake libtool pkg-config \
+            ccache nasm gperf bison flex \
+            python3 python3-dev \
+            libcups2-dev libfontconfig1-dev \
+            libxslt1-dev xsltproc libxml2-utils \
+            libxrandr-dev libx11-dev libxext-dev libxrender-dev \
+            zip wget curl libkrb5-dev gettext
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-core-${{ env.CORE_TAG }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-core-${{ env.CORE_TAG }}-
+            ccache-core-co-25.04-
+            ccache-core-
+
+      - name: Configure ccache
+        run: |
+          ccache --max-size=5G
+          ccache --set-config=compression=true
+          ccache --set-config=compression_level=6
+          ccache -z
+
+      - name: Clone core
+        run: |
+          echo "Cloning core at tag $CORE_TAG ..."
+          git clone --depth=1 --branch "$CORE_TAG" \
+            https://git.libreoffice.org/core core
+          echo "CORE_COMMIT=$(git -C core rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Configure core
+        working-directory: core
+        run: |
+          ./autogen.sh \
+            --with-distro=CPLinux-LOKit \
+            --without-package-format \
+            --disable-symbols \
+            --disable-sal-log
+
+      - name: Build core
+        working-directory: core
+        run: |
+          export CCACHE_DIR="$HOME/.ccache"
+          make -j"$(nproc)"
+
+      - name: Strip binaries
+        working-directory: core
+        run: |
+          find instdir/program -name '*.so' -exec strip --strip-debug {} + 2>/dev/null || true
+          find instdir/program -name '*.bin' -exec strip --strip-debug {} + 2>/dev/null || true
+          find instdir/program -type f -executable ! -name '*.so' \
+            -exec sh -c 'file "$1" | grep -q ELF && strip --strip-debug "$1"' _ {} \; 2>/dev/null || true
+
+      - name: Clean instdir
+        working-directory: core
+        run: |
+          find instdir -name '*.pyc' -delete
+          find instdir -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
+          find instdir -name '*-gdb.py' -delete
+          echo "instdir size:"
+          du -sh instdir/
+          echo "include size:"
+          du -sh include/
+
+      - name: Package tarball
+        run: |
+          TARBALL="core-co-25.04-assets.tar.gz"
+          tar czf "$TARBALL" -C core instdir include
+          ls -lh "$TARBALL"
+          sha256sum "$TARBALL" | tee "${TARBALL}.sha256"
+          echo "TARBALL=$TARBALL" >> "$GITHUB_ENV"
+          echo "TARBALL_SHA256=$(cut -d' ' -f1 < "${TARBALL}.sha256")" >> "$GITHUB_ENV"
+
+      - name: ccache stats
+        if: always()
+        run: ccache -s
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.CORE_TAG }}
+          name: "Core ${{ env.CORE_TAG }}"
+          body: |
+            ## LibreOffice Core Assets
+
+            **Tag**: `${{ env.CORE_TAG }}`
+            **Commit**: `${{ env.CORE_COMMIT }}`
+
+            ### Contents
+            - `instdir/` - LibreOffice core runtime
+            - `include/` - Core headers (LibreOfficeKit/)
+
+            ### SHA256
+            ```
+            ${{ env.TARBALL_SHA256 }}  core-co-25.04-assets.tar.gz
+            ```
+          files: |
+            ${{ env.TARBALL }}
+            ${{ env.TARBALL }}.sha256
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
