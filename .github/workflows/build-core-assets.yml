@@ -3,8 +3,8 @@ name: Build Core Assets
 on:
   workflow_dispatch:
     inputs:
-      core_tag:
-        description: 'Core tag to build (e.g. co-25.04.10-1). Leave empty to auto-detect latest.'
+      source_tag:
+        description: 'Monorepo tag to build (e.g. cp-26.04.2-1). Leave empty to auto-detect latest 26.04.'
         required: false
         default: ''
         type: string
@@ -19,32 +19,32 @@ jobs:
   resolve-tag:
     runs-on: ubuntu-24.04
     outputs:
-      core_tag: ${{ steps.resolve.outputs.core_tag }}
+      source_tag: ${{ steps.resolve.outputs.source_tag }}
       skip: ${{ steps.check.outputs.skip }}
     steps:
-      - name: Resolve core tag
+      - name: Resolve source tag
         id: resolve
         run: |
-          CORE_TAG="${{ inputs.core_tag }}"
-          if [ -z "$CORE_TAG" ]; then
-            echo "No tag specified, finding latest co-25.04* tag..."
-            CORE_TAG=$(git ls-remote --tags --sort=-v:refname \
-              https://git.libreoffice.org/core 'refs/tags/co-25.04*' \
+          SOURCE_TAG="${{ inputs.source_tag }}"
+          if [ -z "$SOURCE_TAG" ]; then
+            echo "No tag specified, finding latest cp-26.04* tag..."
+            SOURCE_TAG=$(git ls-remote --tags --sort=-v:refname \
+              https://gerrit.collaboraoffice.com/online 'refs/tags/cp-26.04*' \
               | grep -v '\^{}' | head -1 | sed 's|.*refs/tags/||')
           fi
-          if [ -z "$CORE_TAG" ]; then
-            echo "::error::Could not resolve a core tag"
+          if [ -z "$SOURCE_TAG" ]; then
+            echo "::error::Could not resolve a source tag"
             exit 1
           fi
-          echo "Resolved core tag: $CORE_TAG"
-          echo "core_tag=$CORE_TAG" >> "$GITHUB_OUTPUT"
+          echo "Resolved source tag: $SOURCE_TAG"
+          echo "source_tag=$SOURCE_TAG" >> "$GITHUB_OUTPUT"
 
       - name: Check if release already exists
         id: check
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="${{ steps.resolve.outputs.core_tag }}"
+          TAG="${{ steps.resolve.outputs.source_tag }}"
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             echo "Release $TAG already exists, skipping build."
             echo "skip=true" >> "$GITHUB_OUTPUT"
@@ -59,7 +59,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 350
     env:
-      CORE_TAG: ${{ needs.resolve-tag.outputs.core_tag }}
+      SOURCE_TAG: ${{ needs.resolve-tag.outputs.source_tag }}
 
     steps:
       - name: Free disk space
@@ -78,9 +78,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential git autoconf automake libtool pkg-config \
-            ccache nasm gperf bison flex \
-            python3 python3-dev \
+            ccache cmake nasm gperf bison flex \
+            python3 python3-dev python3-lxml python3-polib \
             libcups2-dev libfontconfig1-dev \
+            libcap-dev libcppunit-dev libpam0g-dev libpng-dev \
+            libnss3-dev libssl-dev libzstd-dev \
             libxslt1-dev xsltproc libxml2-utils \
             libxrandr-dev libx11-dev libxext-dev libxrender-dev \
             zip wget curl libkrb5-dev gettext
@@ -89,11 +91,11 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.ccache
-          key: ccache-core-${{ env.CORE_TAG }}-${{ github.run_id }}
+          key: ccache-engine-${{ env.SOURCE_TAG }}-${{ github.run_id }}
           restore-keys: |
-            ccache-core-${{ env.CORE_TAG }}-
-            ccache-core-co-25.04-
-            ccache-core-
+            ccache-engine-${{ env.SOURCE_TAG }}-
+            ccache-engine-cp-26.04-
+            ccache-engine-
 
       - name: Configure ccache
         run: |
@@ -102,30 +104,31 @@ jobs:
           ccache --set-config=compression_level=6
           ccache -z
 
-      - name: Clone core
+      - name: Clone monorepo
         run: |
-          echo "Cloning core at tag $CORE_TAG ..."
-          git clone --depth=1 --branch "$CORE_TAG" \
-            https://git.libreoffice.org/core core
-          echo "CORE_COMMIT=$(git -C core rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "Cloning monorepo at tag $SOURCE_TAG ..."
+          git clone --depth=1 --branch "$SOURCE_TAG" \
+            https://gerrit.collaboraoffice.com/online online
+          echo "SOURCE_COMMIT=$(git -C online rev-parse HEAD)" >> "$GITHUB_ENV"
 
-      - name: Configure core
-        working-directory: core
+      - name: Configure engine
+        working-directory: online/engine
         run: |
           ./autogen.sh \
             --with-distro=CPLinux-LOKit \
             --without-package-format \
+            --with-system-nss \
             --disable-symbols \
             --disable-sal-log
 
-      - name: Build core
-        working-directory: core
+      - name: Build engine
+        working-directory: online/engine
         run: |
           export CCACHE_DIR="$HOME/.ccache"
           make -j"$(nproc)"
 
       - name: Strip binaries
-        working-directory: core
+        working-directory: online/engine
         run: |
           find instdir/program -name '*.so' -exec strip --strip-debug {} + 2>/dev/null || true
           find instdir/program -name '*.bin' -exec strip --strip-debug {} + 2>/dev/null || true
@@ -133,7 +136,7 @@ jobs:
             -exec sh -c 'file "$1" | grep -q ELF && strip --strip-debug "$1"' _ {} \; 2>/dev/null || true
 
       - name: Clean instdir
-        working-directory: core
+        working-directory: online/engine
         run: |
           find instdir -name '*.pyc' -delete
           find instdir -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
@@ -145,8 +148,8 @@ jobs:
 
       - name: Package tarball
         run: |
-          TARBALL="core-co-25.04-assets.tar.gz"
-          tar czf "$TARBALL" -C core instdir include
+          TARBALL="core-co-26.04-assets.tar.gz"
+          tar czf "$TARBALL" -C online/engine instdir include
           ls -lh "$TARBALL"
           sha256sum "$TARBALL" | tee "${TARBALL}.sha256"
           echo "TARBALL=$TARBALL" >> "$GITHUB_ENV"
@@ -159,21 +162,21 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ env.CORE_TAG }}
-          name: "Core ${{ env.CORE_TAG }}"
+          tag_name: ${{ env.SOURCE_TAG }}
+          name: "Core assets ${{ env.SOURCE_TAG }}"
           body: |
-            ## LibreOffice Core Assets
+            ## Collabora Office Core Assets
 
-            **Tag**: `${{ env.CORE_TAG }}`
-            **Commit**: `${{ env.CORE_COMMIT }}`
+            **Source tag**: `${{ env.SOURCE_TAG }}`
+            **Source commit**: `${{ env.SOURCE_COMMIT }}`
 
             ### Contents
-            - `instdir/` - LibreOffice core runtime
+            - `instdir/` - Collabora Office engine runtime
             - `include/` - Core headers (LibreOfficeKit/)
 
             ### SHA256
             ```
-            ${{ env.TARBALL_SHA256 }}  core-co-25.04-assets.tar.gz
+            ${{ env.TARBALL_SHA256 }}  core-co-26.04-assets.tar.gz
             ```
           files: |
             ${{ env.TARBALL }}
